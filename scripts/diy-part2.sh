@@ -117,7 +117,7 @@ fi
 # 4. files/ overlay: CN mirrors + first-boot defaults
 echo ""
 echo "[4/4] Setting up files overlay..."
-mkdir -p files/etc/opkg files/etc/uci-defaults files/opt/docker
+mkdir -p files/etc/opkg files/etc/uci-defaults files/etc/crontabs files/opt/docker
 
 # Chinese opkg mirrors (Tsinghua) - same ipq60xx target path as ZN-M2
 cat > files/etc/opkg/distfeeds.conf << 'FEEDSEOF'
