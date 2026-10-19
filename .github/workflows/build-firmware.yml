@@ -1,0 +1,328 @@
+name: Build JDCloud Arthur OpenWrt Firmware
+
+# *** JDCloud RE-SS-01 ONLY - do NOT use for ZN-M2 / Cudy / newifi ***
+# Device: jdcloud_re-ss-01 (qualcommax/ipq60xx), eMMC flash
+# Images: factory.bin + sysupgrade.bin (NOT .ubi - this is eMMC, not NAND)
+
+on:
+  workflow_dispatch:
+  # Auto-build on push so a committed fix is always compiled.
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+
+env:
+  REPO_URL: https://github.com/VIKINGYFY/immortalwrt.git
+  REPO_TAG: main
+  CONFIG_FILE: jdcloud-arthur.config
+  DIY_SH1: diy-part1.sh
+  DIY_SH2: diy-part2.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build JDCloud Arthur Firmware
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show build info
+        run: |
+          echo "============================================"
+          echo " JDCloud Arthur (RE-SS-01) Firmware Build"
+          echo "============================================"
+          echo " Source: VIKINGYFY/ImmortalWrt ${{ env.REPO_TAG }} (NSS Full Support)"
+          echo " Kernel: 6.18 + eBPF/BTF (required by dae)"
+          echo " Target: qualcommax/ipq60xx/jdcloud_re-ss-01 (eMMC)"
+          echo " Images: factory.bin + sysupgrade.bin"
+          echo " Features: daede (kenzok8) + tailscale + ttyd + docker"
+          echo "           + diskman + samba4 + ddns + upnp"
+          echo " Date:   $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "============================================"
+
+      - name: Free disk space
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          echo "=== Before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost /usr/lib/jvm /usr/share/swift
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          sudo apt-get autoremove -y --purge
+          echo "=== After cleanup ==="
+          df -h /
+
+      - name: Setup build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get update
+          sudo -E apt-get install -y \
+            build-essential clang llvm flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-distutils python3-setuptools rsync unzip zlib1g-dev \
+            wget curl time coreutils quilt perl python3-pip
+          sudo -E apt-get clean
+          df -h /
+
+      - name: Create swap file
+        run: |
+          sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=8192
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Clone source code
+        run: |
+          echo "Cloning VIKINGYFY/ImmortalWrt $REPO_TAG (NSS full support)..."
+          git clone --depth 1 --single-branch -b "$REPO_TAG" \
+            "$REPO_URL" openwrt
+
+          cd openwrt
+          echo "=== Git info ==="
+          git log -1 --format="%H %ci %s"
+          echo ""
+          echo "=== Kernel version ==="
+          grep -r "KERNEL_PATCHVER" target/linux/qualcommax/Makefile 2>/dev/null || true
+          echo ""
+          echo "=== Verify ipq60xx subtarget exists ==="
+          grep "ipq60xx" target/linux/qualcommax/Makefile 2>/dev/null || {
+            echo "ERROR: ipq60xx subtarget NOT found!"
+            exit 1
+          }
+          echo "ipq60xx subtarget confirmed."
+          echo ""
+          echo "=== Verify jdcloud_re-ss-01 device definition exists ==="
+          grep -q "define Device/jdcloud_re-ss-01" target/linux/qualcommax/image/ipq60xx.mk || {
+            echo "ERROR: jdcloud_re-ss-01 NOT found in ipq60xx.mk!"
+            echo "Refusing to build - wrong source or device removed."
+            exit 1
+          }
+          echo "jdcloud_re-ss-01 device definition confirmed."
+
+      - name: Cache toolchain and dl
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir
+            openwrt/build_dir/host
+          key: ${{ runner.os }}-arthur-viky-main-${{ hashFiles('configs/jdcloud-arthur.config') }}
+          restore-keys: |
+            ${{ runner.os }}-arthur-viky-main-
+
+      - name: Run DIY script (part 1 - before feeds)
+        run: |
+          cd openwrt
+          chmod +x ../scripts/$DIY_SH1
+          ../scripts/$DIY_SH1
+
+      - name: Update and install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Run DIY script (part 2 - after feeds)
+        run: |
+          cd openwrt
+          chmod +x ../scripts/$DIY_SH2
+          ../scripts/$DIY_SH2
+
+      - name: Apply custom config
+        run: |
+          cd openwrt
+          mkdir -p files
+          echo "=== Overlay files (from diy-part2.sh) ==="
+          find files -type f 2>/dev/null || echo "(empty)"
+          cp ../configs/$CONFIG_FILE .config
+          make defconfig
+
+          echo "=== Key config items ==="
+          grep -E "TARGET_qualcommax|DEVICE.*jdcloud|dae|daed|DEBUG_INFO_BTF|BPF" .config || true
+
+          echo "=== dae packages (dae + luci-app-daede, no daed backend) ==="
+          if grep -q "^CONFIG_PACKAGE_dae=y" .config && grep -q "^CONFIG_PACKAGE_luci-app-daede=y" .config; then
+            echo "  [OK] dae + luci-app-daede selected"
+          else
+            echo "  ::error::dae/luci-app-daede packages NOT selected - check config and feeds!"
+            exit 1
+          fi
+
+          echo "=== eBPF/BTF kernel options (required by dae) ==="
+          for opt in CONFIG_KERNEL_DEBUG_INFO_BTF CONFIG_KERNEL_CGROUP_BPF CONFIG_KERNEL_BPF_EVENTS CONFIG_BPF_TOOLCHAIN_HOST CONFIG_KERNEL_XDP_SOCKETS; do
+            if grep -q "^${opt}=y" .config; then
+              echo "  [OK] $opt=y"
+            else
+              echo "  ::error::$opt is not set - dae will NOT work! Fix configs/jdcloud-arthur.config."
+              exit 1
+            fi
+          done
+
+          echo "=== Chinese (Simplified) language support ==="
+          if grep -q "^CONFIG_LUCI_LANG_zh_Hans=y" .config; then
+            echo "  [OK] CONFIG_LUCI_LANG_zh_Hans=y"
+          else
+            echo "  ::error::CONFIG_LUCI_LANG_zh_Hans is not set!"
+            exit 1
+          fi
+
+          echo "=== tailscale LuCI app (WARNING only - ZN-M2 v4 lesson) ==="
+          if grep -q "^CONFIG_PACKAGE_luci-app-tailscale=y" .config; then
+            echo "  [OK] luci-app-tailscale selected"
+          else
+            echo "  ::warning::luci-app-tailscale NOT selected (feeds may lack it) - tailscale CLI still works"
+          fi
+
+          echo "=== Optional features (user confirmed all 5) ==="
+          for pkg in samba4-server luci-app-samba4 ddns-scripts luci-app-ddns miniupnpd-nftables luci-app-upnp dockerd docker-compose luci-app-dockerman luci-app-diskman; do
+            opt="CONFIG_PACKAGE_$(echo $pkg | tr '-' '_')"
+            if grep -q "^${opt}=y" .config; then
+              echo "  [OK] $pkg"
+            else
+              echo "  ::warning::$pkg NOT selected!"
+            fi
+          done
+
+          echo "=== Verify target device: jdcloud_re-ss-01 ==="
+          if grep -q "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re_ss_01=y" .config; then
+            echo "OK: JDCloud RE-SS-01 device selected correctly!"
+          else
+            echo "ERROR: jdcloud_re-ss-01 NOT selected! Check config."
+            echo "Current target devices:"
+            grep "CONFIG_TARGET.*DEVICE.*=y" .config || true
+            exit 1
+          fi
+          # Guard against wrong-device copy-paste (ZN-M2 / Cudy / newifi)
+          if grep -q "DEVICE_zn_m2=y\|DEVICE_cudy_tr3000\|DEVICE_newifi" .config; then
+            echo "ERROR: wrong device selected (zn_m2/cudy/newifi) - refusing to build!"
+            exit 1
+          fi
+
+          echo "=== Package count ==="
+          grep "=y" .config | wc -l
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j$(nproc) 2>&1 | tail -20 || {
+            echo "Download failed, retrying..."
+            make download -j1 V=s 2>&1 | tail -50
+          }
+
+      - name: Compile firmware
+        run: |
+          cd openwrt
+          echo "Starting compilation at $(date)"
+          set +e
+          make -j$(nproc) V=s 2>&1 | tee build.log | tail -100
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "============================================"
+            echo "First pass failed (rc=$rc), retrying single thread..."
+            echo "============================================"
+            make -j1 V=s 2>&1 | tail -200
+            rc=${PIPESTATUS[0]}
+          fi
+          set -e
+          echo "Compilation finished at $(date) with rc=$rc"
+          exit $rc
+
+      - name: List output files
+        run: |
+          cd openwrt
+          echo "=== Output files ==="
+          find bin/targets/ -type f \( -name "*.bin" -o -name "*.ubi" \) 2>/dev/null || true
+          echo ""
+          echo "=== File sizes ==="
+          ls -lh bin/targets/*/*/ 2>/dev/null || true
+
+      - name: Verify firmware images exist
+        run: |
+          cd openwrt
+          # RE-SS-01 is eMMC: outputs are factory.bin + sysupgrade.bin (NOT .ubi).
+          # Cudy lesson 2026-10-18: require sysupgrade, warn (not fail) if factory missing.
+          if ls bin/targets/*/*/jdcloud_re-ss-01-squashfs-sysupgrade.bin >/dev/null 2>&1; then
+            echo "OK: jdcloud_re-ss-01 sysupgrade.bin produced."
+          else
+            echo "::error::No jdcloud_re-ss-01 sysupgrade.bin found - build produced no firmware!"
+            find bin/targets/ -maxdepth 3 2>/dev/null || true
+            exit 1
+          fi
+          if ls bin/targets/*/*/jdcloud_re-ss-01-squashfs-factory.bin >/dev/null 2>&1; then
+            echo "OK: jdcloud_re-ss-01 factory.bin produced."
+          else
+            echo "::warning::factory.bin not found (sysupgrade.bin is the primary image)"
+          fi
+
+      - name: Prepare artifacts
+        run: |
+          cd openwrt
+          mkdir -p /tmp/firmware-output
+          find bin/targets/ -name "*jdcloud_re-ss-01*" \( -name "*sysupgrade*" -o -name "*factory*" \) 2>/dev/null | \
+            while read f; do cp "$f" /tmp/firmware-output/; done
+          cp .config /tmp/firmware-output/jdcloud-arthur-build-config 2>/dev/null || true
+          cd /tmp/firmware-output
+          sha256sum * > sha256sums.txt 2>/dev/null || true
+          echo "=== Final artifacts ==="
+          ls -lh /tmp/firmware-output/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Arthur-firmware-${{ github.run_id }}
+          path: /tmp/firmware-output/*
+          retention-days: 30
+
+      - name: Create release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: Arthur-${{ github.run_id }}
+          name: JDCloud Arthur Firmware ${{ github.run_id }}
+          body: |
+            ## JDCloud Arthur (RE-SS-01) ImmortalWrt Firmware
+
+            **Build Date:** ${{ github.run_id }}
+            **Source:** VIKINGYFY/ImmortalWrt main (NSS Full Support)
+            **Kernel:** 6.18 + eBPF/BTF (required by dae)
+            **Device:** JDCloud RE-SS-01 (AX1800 Pro, eMMC)
+
+            ### Included Features
+            - **daede** (kenzok8) - dae transparent proxy + LuCI UI + :2023 standalone UI
+            - **tailscale** - remote management (OFF by default, firewall rules pre-installed)
+            - **ttyd** - web terminal
+            - **Docker** (dockerd + compose + dockerman) - data dir /opt/docker on 111GB disk
+            - **luci-app-diskman** - 111GB disk management
+            - **Samba4 / DDNS / UPnP** - all enabled per user confirmation
+            - **zram-swap** (256MB) + htop
+            - **NSS**: nss-drv + nss-dp (ECM DISABLED - caused LAN death on IPQ60xx)
+
+            ### Notes
+            - AdGuardHome / Aria2 run as Docker containers (NOT in firmware)
+            - Scheduled tasks (weekly reboot, dae restart, drop caches) are
+              preset as COMMENTED cron entries - user sets times in LuCI
+            - LAN defaults to 192.168.1.1; change manually AFTER flashing,
+              BEFORE connecting WAN (presetting breaks networking)
+            - 111GB disk (mmcblk0p27): partition per design doc 20/30/50/11GB
+              via LuCI disk management after first boot
+
+            ### Installation
+            1. Flash `*-factory.bin` via U-Boot web recovery (first install)
+            2. Flash `*-sysupgrade.bin` via LuCI (upgrade)
+            3. Default IP: 192.168.1.1
+            4. No default password (set on first login)
+          files: /tmp/firmware-output/*
+          draft: false
+          prerelease: false
